@@ -3,6 +3,7 @@ import fs from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 
@@ -80,8 +81,13 @@ const commands = [
     ),
 ].map((c) => c.toJSON());
 
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const PROJECT_ROOT = path.resolve(__dirname, '..');
+
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates] });
 const player = createAudioPlayer();
+let playbackQueue = Promise.resolve();
 
 /** @type {Map<string, {enabled:boolean, userId:string, sessionUser:string, stopFns:(()=>void)[], activeStreams:Set<any>, sttWorker: STTWorker | null, queue: Promise<void>, lastTranscript:string, lastTranscriptAt:number, lastReplyAt:number, cooldownUntil:number}>} */
 const voiceChatState = new Map();
@@ -98,10 +104,9 @@ class STTWorker {
   start() {
     if (this.proc) return;
 
-    const projectRoot = '/home/node/.openclaw/workspace/discord-voice-bridge';
-    const scriptPath = path.resolve(projectRoot, 'scripts/stt_worker.py');
-    const venvPython = path.resolve(projectRoot, '.venv/bin/python');
-    const pythonBin = process.env.STT_PYTHON || (existsSync(venvPython) ? venvPython : 'python3');
+    const scriptPath = process.env.STT_SCRIPT_PATH || path.resolve(PROJECT_ROOT, 'scripts/stt_worker.py');
+    const venvPython = process.env.STT_PYTHON || path.resolve(PROJECT_ROOT, '.venv/bin/python');
+    const pythonBin = existsSync(venvPython) ? venvPython : 'python3';
 
     this.proc = spawn(pythonBin, [scriptPath], {
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -234,18 +239,28 @@ function sanitizeVoiceReply(text) {
   return noEmoji.replace(/\s+/g, ' ').trim().slice(0, 180);
 }
 
+function queuePlayback(task) {
+  const run = playbackQueue.then(task, task);
+  playbackQueue = run.catch(() => {});
+  return run;
+}
+
 async function speak(text) {
   const safeText = sanitizeVoiceReply(text);
   if (!safeText) return;
+
   const mp3Path = await synthesizeToMp3(safeText);
-  const resource = createAudioResource(mp3Path);
 
-  player.play(resource);
-  await entersState(player, AudioPlayerStatus.Playing, 8_000);
-
-  player.once(AudioPlayerStatus.Idle, async () => {
+  try {
+    await queuePlayback(async () => {
+      const resource = createAudioResource(mp3Path);
+      player.play(resource);
+      await entersState(player, AudioPlayerStatus.Playing, 8_000);
+      await entersState(player, AudioPlayerStatus.Idle, 120_000);
+    });
+  } finally {
     try { await fs.unlink(mp3Path); } catch {}
-  });
+  }
 }
 
 function extractResponseText(data) {
